@@ -1,0 +1,7 @@
+build/
+dist/
+out/
+.vs/
+*.user
+config.json
+config.json.tmp
