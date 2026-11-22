@@ -15,6 +15,8 @@ enum class CrosshairStyle : int {
     CrossDot,
     TShape,
     CircleDot,
+    Square,
+    Image,  // custom PNG
     Count
 };
 
@@ -30,7 +32,21 @@ struct CrosshairSettings {
     float offsetX = 0.0f;
     float offsetY = 0.0f;
     int anchor = 1;  // 0 = monitor center, 1 = center of the game window (handles windowed / title bars)
+    // extended
+    float rotation = 0.0f;        // degrees
+    float dotSize = 0.0f;         // 0 = same as thickness
+    std::array<float, 4> outlineColor{0.0f, 0.0f, 0.0f, 0.85f};
+    bool armTop = true, armBottom = true, armLeft = true, armRight = true;
+    bool rainbow = false;         // cycle hue
+    float rainbowSpeed = 0.3f;
+    bool hideWhileZoom = true;
+    bool hideWhileRmb = false;    // hide while aiming down sights
+    // custom image
+    std::string imagePath;        // UTF-8
+    float imageScale = 1.0f;
+    bool imageTint = false;       // multiply by color
 };
+
 
 struct SharpenSettings {
     bool enabled = false;
@@ -60,9 +76,35 @@ struct Profile {
     VignetteSettings vignette;
     CrosshairSettings crosshair;
     ZoomSettings zoom;
+    std::string autoExe;  // switch to this profile when this exe is in front, e.g. RustClient.exe
 };
 
 inline constexpr int kProfileCount = 4;
+
+// vk + MOD_ALT/MOD_CONTROL/MOD_SHIFT. vk 0 = unbound. Mouse buttons are polled, keys use RegisterHotKey.
+struct KeyBind {
+    int vk = 0;
+    int mods = 0;
+    bool operator==(const KeyBind&) const = default;
+};
+
+enum class BindId : int {
+    Menu = 0,
+    Panic,
+    ToggleAll,
+    Profile1,
+    Profile2,
+    Profile3,
+    Profile4,
+    NextProfile,
+    ToggleCrosshair,
+    ToggleShaders,
+    Compare,  // hold: show the original picture
+    Count
+};
+inline constexpr int kBindCount = static_cast<int>(BindId::Count);
+
+std::string KeyBindName(const KeyBind& b);
 
 struct AppConfig {
     AppConfig();
@@ -76,6 +118,11 @@ struct AppConfig {
     std::array<float, 3> accent{0.91f, 0.34f, 0.23f};
     int saturationEngine = 0;  // 0 = GPU driver (zero cost, falls back to DWM), 1 = DWM matrix (exact Rec.709)
     int vibranceMode = 0;      // 0 = GPU driver (zero cost), 1 = capture shader (exact, costs FPS)
+    std::array<KeyBind, kBindCount> binds{};
+    bool startWithWindows = false;
+    bool showToasts = true;
+    bool autoProfile = false;
+    bool pauseWhenNotFocused = false;  // only apply while an auto-profile game is in front
     std::array<Profile, kProfileCount> profiles;
 
     [[nodiscard]] Profile& Active() noexcept { return profiles[static_cast<size_t>(activeProfile)]; }

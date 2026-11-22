@@ -12,7 +12,10 @@ using nlohmann::json;
 
 namespace {
 
-constexpr int kConfigVersion = 2;
+constexpr int kConfigVersion = 3;
+constexpr const char* kBindKeys[] = {"menu", "panic", "toggleAll", "profile1", "profile2", "profile3",
+                                     "profile4", "nextProfile", "toggleCrosshair", "toggleShaders", "compare"};
+static_assert(std::size(kBindKeys) == static_cast<size_t>(kBindCount));
 
 
 json Write(const ColorParams& p) {
@@ -38,6 +41,11 @@ json Write(const CrosshairSettings& c) {
         {"thickness", c.thickness}, {"gap", c.gap},     {"color", c.color},
         {"outline", c.outline}, {"outlineThickness", c.outlineThickness},
         {"offsetX", c.offsetX}, {"offsetY", c.offsetY}, {"anchor", c.anchor},
+        {"rotation", c.rotation}, {"dotSize", c.dotSize}, {"outlineColor", c.outlineColor},
+        {"armTop", c.armTop}, {"armBottom", c.armBottom}, {"armLeft", c.armLeft}, {"armRight", c.armRight},
+        {"rainbow", c.rainbow}, {"rainbowSpeed", c.rainbowSpeed}, {"hideWhileZoom", c.hideWhileZoom},
+        {"hideWhileRmb", c.hideWhileRmb}, {"imagePath", c.imagePath}, {"imageScale", c.imageScale},
+        {"imageTint", c.imageTint},
     };
 }
 
@@ -54,6 +62,7 @@ json Write(const Profile& p) {
         {"vignette", Write(p.vignette)},
         {"crosshair", Write(p.crosshair)},
         {"zoom", Write(p.zoom)},
+        {"autoExe", p.autoExe},
     };
 }
 
@@ -118,6 +127,25 @@ void Read(const json& j, CrosshairSettings& c) {
     ReadField(j, "offsetX", c.offsetX);
     ReadField(j, "offsetY", c.offsetY);
     ReadField(j, "anchor", c.anchor);
+    ReadField(j, "rotation", c.rotation);
+    ReadField(j, "dotSize", c.dotSize);
+    ReadField(j, "outlineColor", c.outlineColor);
+    ReadField(j, "armTop", c.armTop);
+    ReadField(j, "armBottom", c.armBottom);
+    ReadField(j, "armLeft", c.armLeft);
+    ReadField(j, "armRight", c.armRight);
+    ReadField(j, "rainbow", c.rainbow);
+    ReadField(j, "rainbowSpeed", c.rainbowSpeed);
+    ReadField(j, "hideWhileZoom", c.hideWhileZoom);
+    ReadField(j, "hideWhileRmb", c.hideWhileRmb);
+    ReadField(j, "imagePath", c.imagePath);
+    ReadField(j, "imageScale", c.imageScale);
+    ReadField(j, "imageTint", c.imageTint);
+    c.rotation = std::clamp(c.rotation, -180.0f, 180.0f);
+    c.dotSize = std::clamp(c.dotSize, 0.0f, 20.0f);
+    c.rainbowSpeed = std::clamp(c.rainbowSpeed, 0.02f, 3.0f);
+    c.imageScale = std::clamp(c.imageScale, 0.05f, 8.0f);
+    for (float& ch : c.outlineColor) ch = std::clamp(ch, 0.0f, 1.0f);
     c.anchor = std::clamp(c.anchor, 0, 1);
     c.style = std::clamp(c.style, 0, static_cast<int>(CrosshairStyle::Count) - 1);
     c.size = std::clamp(c.size, 1.0f, 200.0f);
@@ -149,6 +177,8 @@ void Read(const json& j, Profile& p) {
     if (auto it = j.find("vignette"); it != j.end()) Read(*it, p.vignette);
     if (auto it = j.find("crosshair"); it != j.end()) Read(*it, p.crosshair);
     if (auto it = j.find("zoom"); it != j.end()) Read(*it, p.zoom);
+    ReadField(j, "autoExe", p.autoExe);
+    if (p.autoExe.size() > 260) p.autoExe.resize(260);
 }
 
 std::filesystem::path ExeDirectory() {
@@ -169,6 +199,37 @@ std::filesystem::path ExeDirectory() {
 
 AppConfig::AppConfig() {
     for (int i = 0; i < kProfileCount; ++i) profiles[static_cast<size_t>(i)] = DefaultProfile(i);
+    auto set = [&](BindId id, int vk, int mods) { binds[static_cast<size_t>(id)] = KeyBind{vk, mods}; };
+    set(BindId::Menu, VK_INSERT, 0);
+    set(BindId::Panic, VK_END, 0);
+    for (int i = 0; i < kProfileCount; ++i) set(static_cast<BindId>(static_cast<int>(BindId::Profile1) + i), VK_F1 + i, MOD_CONTROL);
+}
+
+std::string KeyBindName(const KeyBind& b) {
+    if (b.vk == 0) return "None";
+    std::string s;
+    if (b.mods & MOD_CONTROL) s += "Ctrl+";
+    if (b.mods & MOD_ALT) s += "Alt+";
+    if (b.mods & MOD_SHIFT) s += "Shift+";
+    switch (b.vk) {
+        case VK_LBUTTON: return s + "Mouse 1";
+        case VK_RBUTTON: return s + "Mouse 2";
+        case VK_MBUTTON: return s + "Mouse 3";
+        case VK_XBUTTON1: return s + "Mouse 4";
+        case VK_XBUTTON2: return s + "Mouse 5";
+        default: break;
+    }
+    if (b.vk >= VK_F1 && b.vk <= VK_F24) return s + "F" + std::to_string(b.vk - VK_F1 + 1);
+    UINT sc = MapVirtualKeyW(static_cast<UINT>(b.vk), MAPVK_VK_TO_VSC);
+    switch (b.vk) {  // extended keys need the flag or they read as numpad
+        case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
+        case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN: case VK_RCONTROL: case VK_RMENU: case VK_DIVIDE:
+            sc |= 0x100; break;
+        default: break;
+    }
+    char name[64] = {};
+    if (sc && GetKeyNameTextA(static_cast<LONG>(sc << 16), name, sizeof(name)) > 0) return s + name;
+    return s + "Key " + std::to_string(b.vk);
 }
 
 Profile AppConfig::DefaultProfile(int slot) {
@@ -233,6 +294,21 @@ bool LoadConfig(const std::filesystem::path& path, AppConfig& cfg, std::string& 
     cfg.saturationEngine = std::clamp(cfg.saturationEngine, 0, 1);
     ReadField(root, "vibranceMode", cfg.vibranceMode);
     cfg.vibranceMode = std::clamp(cfg.vibranceMode, 0, 1);
+    ReadField(root, "startWithWindows", cfg.startWithWindows);
+    ReadField(root, "showToasts", cfg.showToasts);
+    ReadField(root, "autoProfile", cfg.autoProfile);
+    ReadField(root, "pauseWhenNotFocused", cfg.pauseWhenNotFocused);
+    if (auto it = root.find("binds"); it != root.end() && it->is_object()) {
+        for (int i = 0; i < kBindCount; ++i) {
+            if (auto b = it->find(kBindKeys[i]); b != it->end() && b->is_object()) {
+                KeyBind& k = cfg.binds[static_cast<size_t>(i)];
+                ReadField(*b, "vk", k.vk);
+                ReadField(*b, "mods", k.mods);
+                if (k.vk < 0 || k.vk > 0xFE) k.vk = 0;
+                k.mods &= MOD_ALT | MOD_CONTROL | MOD_SHIFT;
+            }
+        }
+    }
     cfg.wallpaperBlur = std::clamp(cfg.wallpaperBlur, 0.0f, 1.0f);
     for (float& ch : cfg.accent) ch = std::clamp(ch, 0.0f, 1.0f);
 
@@ -267,6 +343,16 @@ bool SaveConfig(const std::filesystem::path& path, const AppConfig& cfg, std::st
     root["accent"] = cfg.accent;
     root["saturationEngine"] = cfg.saturationEngine;
     root["vibranceMode"] = cfg.vibranceMode;
+    root["startWithWindows"] = cfg.startWithWindows;
+    root["showToasts"] = cfg.showToasts;
+    root["autoProfile"] = cfg.autoProfile;
+    root["pauseWhenNotFocused"] = cfg.pauseWhenNotFocused;
+    {
+        json b = json::object();
+        for (int i = 0; i < kBindCount; ++i)
+            b[kBindKeys[i]] = json{{"vk", cfg.binds[static_cast<size_t>(i)].vk}, {"mods", cfg.binds[static_cast<size_t>(i)].mods}};
+        root["binds"] = std::move(b);
+    }
     json profiles = json::array();
     for (const Profile& p : cfg.profiles) profiles.push_back(Write(p));
     root["profiles"] = std::move(profiles);

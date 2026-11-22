@@ -22,6 +22,16 @@ The exe ends up in `build/Release` together with `Shaders.hlsl`. Settings are sa
 - End - reset filters of the current profile
 - Zoom - hold the selected key (Mouse 5 by default)
 
+All binds can be changed in Advanced (keys, modifiers, mouse 2-5). Extra actions: toggle everything,
+next profile, crosshair on/off, shaders on/off, hold to show the original picture.
+
+## Features added in 1.1
+
+- Custom crosshair images (PNG with transparency), scale, tint, rotation
+- Crosshair: dot size, per-arm toggles, outline color, square style, rainbow, hide while zooming / aiming
+- Auto profile by game exe, optional "effects off outside these games"
+- Start with Windows, notifications on/off
+
 ## Notes
 
 - Brightness, contrast, exposure, RGB, invert and gamma go through the hardware gamma LUT, and

@@ -12,6 +12,9 @@
 #include <shellapi.h>
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <psapi.h>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -29,11 +32,7 @@ constexpr wchar_t kHostClass[] = L"PopaVisual.Host";
 constexpr UINT WM_PV_TRAY = WM_APP + 1;
 constexpr UINT kTrayId = 1;
 
-enum HotkeyId : int {
-    kHotkeyMenu = 1,
-    kHotkeyPanic = 2,
-    kHotkeyProfileBase = 10,  // 10..13
-};
+constexpr int kHotkeyBase = 100;  // 100 + BindId
 
 enum TrayCommand : UINT {
     kCmdProfileBase = 100,  // 100..103
@@ -123,8 +122,26 @@ private:
     void UpdateLayout();
     void RestoreDisplay() noexcept;
     // vibrance only goes through the capture shader in "exact" mode
+    bool On() const noexcept { return m_cfg.masterEnabled && !m_compareHeld && !m_autoPaused; }
+    bool CaptureNeeded() const noexcept {
+        const pv::Profile& p = m_cfg.Active();
+        if (!On()) return false;
+        return m_zoomHeld || (!m_shadersOff && (p.sharpen.enabled || ShaderVibrance() != 0.0f));
+    }
+    bool CrosshairVisible() const noexcept {
+        const pv::CrosshairSettings& x = m_cfg.Active().crosshair;
+        if (!On() || !x.enabled) return false;
+        if (x.hideWhileZoom && m_zoomHeld) return false;
+        if (x.hideWhileRmb && m_rmbHeld && !m_menuOpen) return false;
+        return true;
+    }
+    void OnBind(pv::BindId id);
+    bool BindDown(const pv::KeyBind& b) const noexcept;
+    void PollBinds();
+    void UpdateAutoProfile();
+    void ApplyStartup();
     float ShaderVibrance() const noexcept {
-        return (m_cfg.masterEnabled && m_cfg.vibranceMode == 1) ? m_cfg.Active().color.vibrance : 0.0f;
+        return (On() && m_cfg.vibranceMode == 1) ? m_cfg.Active().color.vibrance : 0.0f;
     }
 
     [[nodiscard]] RECT PrimaryMonitorRect() const;
@@ -176,6 +193,20 @@ private:
     Clock::time_point m_lastFrame{};
     Clock::time_point m_lastTopmost{};
 
+    bool m_compareHeld = false;
+    bool m_autoPaused = false;
+    bool m_shadersOff = false;
+    bool m_rmbHeld = false;
+    bool m_bindCapture = false;
+    std::array<bool, pv::kBindCount> m_bindWasDown{};
+    std::array<bool, pv::kBindCount> m_bindRegistered{};
+    std::array<pv::KeyBind, pv::kBindCount> m_registeredBinds{};
+    bool m_startupApplied = false;
+    bool m_lastStartup = false;
+    Clock::time_point m_lastAutoCheck{};
+    std::string m_lastGameExe;
+    float m_crossTime = 0.0f;
+    Clock::time_point m_startTime = Clock::now();
     std::string m_toast;
     Clock::time_point m_toastUntil{};
 };
@@ -334,7 +365,7 @@ void App::UpdateLayout() {
     const int monW = mon.right - mon.left;
     const int monH = mon.bottom - mon.top;
     const pv::Profile& p = m_cfg.Active();
-    const bool on = m_cfg.masterEnabled;
+    const bool on = On();
 
     // crosshair center: monitor center, or the center of the game's client area
     // (a windowed game or a title bar shifts the game's own crosshair down)
@@ -359,16 +390,16 @@ void App::UpdateLayout() {
     Layout layout = Layout::Hidden;
     RECT r{};
     const bool full = m_menuOpen || m_ui.MenuVisible() ||
-                      (on && (p.sharpen.enabled || ShaderVibrance() != 0.0f || p.vignette.enabled || m_zoomHeld));
+                      (on && (CaptureNeeded() || (p.vignette.enabled && !m_shadersOff)));
     if (full) {
         layout = Layout::Full;
         r = mon;
     } else {
-        const bool crosshair = on && p.crosshair.enabled;
+        const bool crosshair = CrosshairVisible();
         const bool toast = !m_toast.empty();
         if (crosshair) {
             const auto& x = p.crosshair;
-            const float reach = std::max(x.size + x.gap, x.size) + x.thickness + x.outlineThickness * 2.0f + 6.0f;
+            const float reach = m_ui.CrosshairReach(x);
             const int ext = static_cast<int>(std::ceil(reach));
             const int cx = m_anchor.x + static_cast<int>(std::lround(x.offsetX));
             const int cy = m_anchor.y + static_cast<int>(std::lround(x.offsetY));
@@ -410,16 +441,167 @@ void App::UpdateLayout() {
 
 void App::RegisterHotkeys() {
     m_hotkeysOk = true;
-    m_hotkeysOk &= RegisterHotKey(m_host, kHotkeyMenu, MOD_NOREPEAT, VK_INSERT) != FALSE;
-    m_hotkeysOk &= RegisterHotKey(m_host, kHotkeyPanic, MOD_NOREPEAT, VK_END) != FALSE;
-    for (int i = 0; i < pv::kProfileCount; ++i)
-        m_hotkeysOk &= RegisterHotKey(m_host, kHotkeyProfileBase + i, MOD_CONTROL | MOD_NOREPEAT, VK_F1 + i) != FALSE;
+    for (int i = 0; i < pv::kBindCount; ++i) {
+        const pv::KeyBind& b = m_cfg.binds[static_cast<size_t>(i)];
+        m_registeredBinds[static_cast<size_t>(i)] = b;
+        m_bindRegistered[static_cast<size_t>(i)] = false;
+        // mouse buttons and the hold-to-compare key are polled instead (RegisterHotKey can't do them)
+        const bool mouse = b.vk >= VK_LBUTTON && b.vk <= VK_XBUTTON2;
+        if (b.vk == 0 || mouse || static_cast<pv::BindId>(i) == pv::BindId::Compare) continue;
+        const bool ok = RegisterHotKey(m_host, kHotkeyBase + i, static_cast<UINT>(b.mods) | MOD_NOREPEAT, static_cast<UINT>(b.vk)) != FALSE;
+        m_bindRegistered[static_cast<size_t>(i)] = ok;
+        m_hotkeysOk &= ok;
+    }
 }
 
 void App::UnregisterHotkeys() noexcept {
-    UnregisterHotKey(m_host, kHotkeyMenu);
-    UnregisterHotKey(m_host, kHotkeyPanic);
-    for (int i = 0; i < pv::kProfileCount; ++i) UnregisterHotKey(m_host, kHotkeyProfileBase + i);
+    for (int i = 0; i < pv::kBindCount; ++i) {
+        if (m_bindRegistered[static_cast<size_t>(i)]) UnregisterHotKey(m_host, kHotkeyBase + i);
+        m_bindRegistered[static_cast<size_t>(i)] = false;
+    }
+}
+
+bool App::BindDown(const pv::KeyBind& b) const noexcept {
+    if (b.vk == 0 || (GetAsyncKeyState(b.vk) & 0x8000) == 0) return false;
+    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    if (((b.mods & MOD_CONTROL) != 0) != down(VK_CONTROL)) return false;
+    if (((b.mods & MOD_ALT) != 0) != down(VK_MENU)) return false;
+    if (((b.mods & MOD_SHIFT) != 0) != down(VK_SHIFT)) return false;
+    return true;
+}
+
+void App::PollBinds() {
+    if (m_bindCapture) return;
+    for (int i = 0; i < pv::kBindCount; ++i) {
+        const auto id = static_cast<pv::BindId>(i);
+        const pv::KeyBind& b = m_cfg.binds[static_cast<size_t>(i)];
+        const bool polled = id == pv::BindId::Compare || (b.vk >= VK_LBUTTON && b.vk <= VK_XBUTTON2);
+        if (!polled) continue;
+        const bool down = BindDown(b);
+        if (id == pv::BindId::Compare) {
+            if (down != m_compareHeld && !m_menuOpen) {
+                m_compareHeld = down;
+                ApplyColorPipeline();
+                m_contentDirty = true;
+            }
+        } else if (down && !m_bindWasDown[static_cast<size_t>(i)]) {
+            // mouse 1/2 binds would fire on every click in the menu
+            if (!m_menuOpen) OnBind(id);
+        }
+        m_bindWasDown[static_cast<size_t>(i)] = down;
+    }
+}
+
+void App::OnBind(pv::BindId id) {
+    switch (id) {
+        case pv::BindId::Menu: SetMenuOpen(!m_menuOpen); break;
+        case pv::BindId::Panic: Panic(); break;
+        case pv::BindId::ToggleAll: ToggleMaster(); break;
+        case pv::BindId::Profile1:
+        case pv::BindId::Profile2:
+        case pv::BindId::Profile3:
+        case pv::BindId::Profile4:
+            SwitchProfile(static_cast<int>(id) - static_cast<int>(pv::BindId::Profile1));
+            break;
+        case pv::BindId::NextProfile: SwitchProfile((m_cfg.activeProfile + 1) % pv::kProfileCount); break;
+        case pv::BindId::ToggleCrosshair: {
+            auto& x = m_cfg.Active().crosshair;
+            x.enabled = !x.enabled;
+            MarkConfigDirty();
+            ShowToast(x.enabled ? "Crosshair on" : "Crosshair off");
+            break;
+        }
+        case pv::BindId::ToggleShaders:
+            m_shadersOff = !m_shadersOff;
+            m_contentDirty = true;
+            ShowToast(m_shadersOff ? "Shaders paused" : "Shaders on");
+            break;
+        default: break;
+    }
+}
+
+namespace {
+std::string ExeOfWindow(HWND w) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (!pid) return {};
+    // only the image name of the process, no access to its memory
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return {};
+    wchar_t buf[MAX_PATH];
+    DWORD n = MAX_PATH;
+    std::string out;
+    if (QueryFullProcessImageNameW(h, 0, buf, &n)) {
+        std::wstring p(buf, n);
+        const size_t s = p.find_last_of(L"\\/");
+        out = Narrow(s == std::wstring::npos ? p : p.substr(s + 1));
+    }
+    CloseHandle(h);
+    return out;
+}
+bool SameExe(const std::string& a, const std::string& b) {
+    return !a.empty() && a.size() == b.size() && CompareStringOrdinal(Widen(a).c_str(), -1, Widen(b).c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+}  // namespace
+
+void App::UpdateAutoProfile() {
+    const auto now = Clock::now();
+    if (now - m_lastAutoCheck < std::chrono::milliseconds(500)) return;
+    m_lastAutoCheck = now;
+    const HWND fg = GetForegroundWindow();
+    if (!fg || fg == m_overlay || fg == m_host) return;
+    const std::string exe = ExeOfWindow(fg);
+    if (exe.empty()) return;
+    m_lastGameExe = exe;
+    m_ui.SetForegroundExe(exe);
+    if (!m_cfg.autoProfile) {
+        if (m_autoPaused) {
+            m_autoPaused = false;
+            ApplyColorPipeline();
+        }
+        return;
+    }
+    int match = -1;
+    for (int i = 0; i < pv::kProfileCount; ++i) {
+        std::string list = m_cfg.profiles[static_cast<size_t>(i)].autoExe;
+        // several exes separated by ; or ,
+        size_t start = 0;
+        while (start <= list.size() && match < 0) {
+            size_t end = list.find_first_of(";,", start);
+            if (end == std::string::npos) end = list.size();
+            std::string item = list.substr(start, end - start);
+            while (!item.empty() && item.front() == ' ') item.erase(item.begin());
+            while (!item.empty() && item.back() == ' ') item.pop_back();
+            if (SameExe(item, exe)) match = i;
+            start = end + 1;
+        }
+        if (match >= 0) break;
+    }
+    if (match >= 0 && match != m_cfg.activeProfile) SwitchProfile(match);
+    const bool paused = m_cfg.pauseWhenNotFocused && match < 0;
+    if (paused != m_autoPaused) {
+        m_autoPaused = paused;
+        ApplyColorPipeline();
+        m_contentDirty = true;
+    }
+}
+
+void App::ApplyStartup() {
+    if (m_startupApplied && m_lastStartup == m_cfg.startWithWindows) return;
+    m_startupApplied = true;
+    m_lastStartup = m_cfg.startWithWindows;
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return;
+    if (m_cfg.startWithWindows) {
+        wchar_t exe[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        const std::wstring v = L"\"" + std::wstring(exe, n) + L"\"";
+        RegSetValueExW(key, L"PopaVisual", 0, REG_SZ, reinterpret_cast<const BYTE*>(v.c_str()), static_cast<DWORD>((v.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(key, L"PopaVisual");
+    }
+    RegCloseKey(key);
 }
 
 void App::AddTrayIcon() {
@@ -457,7 +639,7 @@ void App::ShowTrayMenu() {
     UniqueMenu menu(CreatePopupMenu());
     if (!menu) return;
     for (int i = 0; i < pv::kProfileCount; ++i) {
-        const std::wstring label = L"Ctrl+F" + std::to_wstring(i + 1) + L"   " + Widen(m_cfg.profiles[static_cast<size_t>(i)].name);
+        const std::wstring label = Widen(pv::KeyBindName(m_cfg.binds[static_cast<size_t>(static_cast<int>(pv::BindId::Profile1) + i)])) + L"   " + Widen(m_cfg.profiles[static_cast<size_t>(i)].name);
         AppendMenuW(menu.get(), MF_STRING | (m_cfg.activeProfile == i ? MF_CHECKED : 0), kCmdProfileBase + i, label.c_str());
     }
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
@@ -521,7 +703,7 @@ void App::SwitchProfile(int index) {
     ApplyColorPipeline();
     MarkConfigDirty();
     UpdateTrayTip();
-    ShowToast("Ctrl+F" + std::to_string(index + 1) + ": " + m_cfg.Active().name);
+    ShowToast(m_cfg.Active().name);
 }
 
 void App::ToggleMaster() {
@@ -557,7 +739,7 @@ void App::RequestExit() {
 //   if Windows rejects the full LUT, the linear part moves to the DWM matrix instead.
 // The DWM effect is the only part that costs game FPS, so it is used as little as possible.
 void App::ApplyColorPipeline(bool force) {
-    pv::ColorParams params = m_cfg.masterEnabled ? m_cfg.Active().color : pv::ColorParams{};
+    pv::ColorParams params = On() ? m_cfg.Active().color : pv::ColorParams{};
     // engine id also encodes the vibrance mode so a mode switch re-applies
     const int engine = m_cfg.saturationEngine + m_cfg.vibranceMode * 2;
     if (!force && m_hasApplied && params == m_appliedParams && engine == m_appliedEngine) return;
@@ -611,6 +793,7 @@ void App::SaveConfigNow() {
 }
 
 void App::ShowToast(std::string text) {
+    if (!m_cfg.showToasts) return;
     m_toast = std::move(text);
     m_toastUntil = Clock::now() + std::chrono::milliseconds(1800);
     m_contentDirty = true;
@@ -618,9 +801,32 @@ void App::ShowToast(std::string text) {
 
 void App::Tick() {
     const auto now = Clock::now();
+    PollBinds();
+    UpdateAutoProfile();
+    ApplyStartup();
+    {
+        const bool cap = m_ui.CapturingBind();
+        if (cap != m_bindCapture) {
+            m_bindCapture = cap;
+            if (cap) UnregisterHotkeys();
+            else RegisterHotkeys();
+        } else if (!cap && m_cfg.binds != m_registeredBinds) {
+            UnregisterHotkeys();
+            RegisterHotkeys();
+        }
+    }
+    {
+        const bool rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+        if (rmb != m_rmbHeld) {
+            m_rmbHeld = rmb;
+            if (m_cfg.Active().crosshair.hideWhileRmb) m_contentDirty = true;
+        }
+    }
+    m_crossTime = std::chrono::duration<float>(now - m_startTime).count();
+    if (CrosshairVisible() && m_cfg.Active().crosshair.rainbow) m_contentDirty = true;
     const pv::Profile& p = m_cfg.Active();
 
-    const bool zoomHeld = m_cfg.masterEnabled && p.zoom.enabled && !m_menuOpen &&
+    const bool zoomHeld = On() && p.zoom.enabled && !m_menuOpen && !m_bindCapture &&
                           (GetAsyncKeyState(p.zoom.holdKey) & 0x8000) != 0;
     if (zoomHeld != m_zoomHeld) {
         m_zoomHeld = zoomHeld;
@@ -628,7 +834,7 @@ void App::Tick() {
     }
 
     // an open duplication session alone makes DWM do extra work, so it only exists while needed
-    if (m_graphicsOk) m_dx.SetCaptureEnabled(m_cfg.masterEnabled && (p.sharpen.enabled || ShaderVibrance() != 0.0f || m_zoomHeld));
+    if (m_graphicsOk) m_dx.SetCaptureEnabled(CaptureNeeded());
 
     if (!m_toast.empty() && now >= m_toastUntil + std::chrono::milliseconds(50)) {
         m_toast.clear();
@@ -639,8 +845,12 @@ void App::Tick() {
     UpdateLayout();
 
     const bool animating = m_menuOpen || m_ui.MenuVisible() || toastActive;
-    const bool captureLive = m_cfg.masterEnabled && (p.sharpen.enabled || ShaderVibrance() != 0.0f || m_zoomHeld);
-    const DWORD idleTimeout = (m_cfg.masterEnabled && p.zoom.enabled) ? 8 : 100;
+    const bool captureLive = CaptureNeeded();
+    bool polled = m_cfg.Active().crosshair.hideWhileRmb;
+    for (const auto& b : m_cfg.binds) polled |= b.vk >= VK_LBUTTON && b.vk <= VK_XBUTTON2;
+    polled |= m_cfg.binds[static_cast<size_t>(pv::BindId::Compare)].vk != 0;
+    const bool rainbow = CrosshairVisible() && m_cfg.Active().crosshair.rainbow;
+    const DWORD idleTimeout = ((On() && p.zoom.enabled) || rainbow) ? 8 : (polled ? 20 : 100);
 
     if (!m_graphicsOk || m_layout == Layout::Hidden) {
         m_frameMs = 0.0f;
@@ -680,14 +890,14 @@ void App::RenderFrame(UINT syncInterval) {
     const auto frameStart = Clock::now();
 
     m_dx.BeginFrame();
-    if (m_cfg.masterEnabled) {
+    if (On()) {
         const pv::Profile& p = m_cfg.Active();
         pv::EffectParams ep;
-        ep.sharpen = p.sharpen.enabled;
+        ep.sharpen = p.sharpen.enabled && !m_shadersOff;
         ep.vibrance = ShaderVibrance();
         ep.sharpenStrength = p.sharpen.strength;
         ep.sharpenClamp = p.sharpen.clamp;
-        ep.vignette = p.vignette.enabled;
+        ep.vignette = p.vignette.enabled && !m_shadersOff;
         ep.vignetteStrength = p.vignette.strength;
         ep.vignetteRadius = p.vignette.radius;
         ep.vignetteSoftness = p.vignette.softness;
@@ -699,7 +909,7 @@ void App::RenderFrame(UINT syncInterval) {
     }
 
     m_ui.BeginFrame(m_menuOpen);
-    if (m_cfg.masterEnabled && m_cfg.Active().crosshair.enabled) m_ui.DrawCrosshair(m_cfg.Active().crosshair);
+    if (CrosshairVisible()) m_ui.DrawCrosshair(m_cfg.Active().crosshair, m_crossTime);
 
     if (!m_toast.empty()) {
         const float remaining = std::chrono::duration<float>(m_toastUntil - Clock::now()).count();
@@ -728,7 +938,7 @@ void App::RenderFrame(UINT syncInterval) {
                 if (!cost.empty()) cost += ", ";
                 cost += what;
             };
-            const bool on = m_cfg.masterEnabled;
+            const bool on = On();
             add(m_mag->Active(), "DWM color effect");
             add(on && ShaderVibrance() != 0.0f, "Vibrance");
             add(on && ap.sharpen.enabled, "LumaSharpen");
@@ -808,13 +1018,8 @@ LRESULT App::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         switch (msg) {
             case WM_HOTKEY: {
-                const int id = static_cast<int>(wParam);
-                if (id == kHotkeyMenu)
-                    SetMenuOpen(!m_menuOpen);
-                else if (id == kHotkeyPanic)
-                    Panic();
-                else if (id >= kHotkeyProfileBase && id < kHotkeyProfileBase + pv::kProfileCount)
-                    SwitchProfile(id - kHotkeyProfileBase);
+                const int id = static_cast<int>(wParam) - kHotkeyBase;
+                if (id >= 0 && id < pv::kBindCount && !m_bindCapture) OnBind(static_cast<pv::BindId>(id));
                 return 0;
             }
             case WM_PV_TRAY:

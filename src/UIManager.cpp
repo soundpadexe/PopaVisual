@@ -65,10 +65,11 @@ const char* HoldKeyName(int vk) {
     return "Custom";
 }
 
-constexpr const char* kStyles[] = {"Dot", "Cross", "Circle", "Cross + Dot", "T-Shape", "Circle + Dot"};
+constexpr const char* kStyles[] = {"Dot", "Cross", "Circle", "Cross + Dot", "T-Shape", "Circle + Dot", "Square", "Custom image"};
 static_assert(std::size(kStyles) == static_cast<size_t>(CrosshairStyle::Count));
 
-constexpr const char* kTabNames[] = {"Color", "Shaders", "Crosshair", "Zoom", "Profiles", "Settings"};
+constexpr const char* kTabNames[] = {"Color", "Shaders", "Crosshair", "Zoom", "Profiles", "Advanced", "Settings"};
+constexpr int kTabIcons[] = {0, 1, 2, 3, 4, 6, 5};
 
 // CPU copy of the pipeline for previews: vibrance -> DWM matrix -> gamma ramp
 std::array<float, 3> Preview(const Mat5& m, const ColorParams& p, float r, float g, float b) {
@@ -196,6 +197,10 @@ bool UIManager::Initialize(HWND hwnd, ID3D11Device* device, ID3D11DeviceContext*
 }
 
 void UIManager::Shutdown() noexcept {
+    delete m_capture;
+    m_capture = nullptr;
+    m_xhTex.Reset();
+    m_xhLoaded.clear();
     m_wallpaper.Reset();
     m_wallBlur.Reset();
     m_blurSource.clear();
@@ -550,59 +555,169 @@ void UIManager::DrawIcon(ImDrawList* dl, int icon, const ImVec2& c, float size, 
             dl->AddCircle(c, r * 0.22f, col, 16, t);
             break;
         }
+        case 6: {  // advanced: keyboard
+            const ImVec2 a = c + ImVec2(-r * 0.92f, -r * 0.55f), b = c + ImVec2(r * 0.92f, r * 0.55f);
+            dl->AddRect(a, b, col, r * 0.18f, 0, t);
+            for (int row = 0; row < 2; ++row)
+                for (int k = 0; k < 4; ++k)
+                    dl->AddRectFilled(ImVec2(a.x + r * (0.28f + k * 0.40f), a.y + r * (0.26f + row * 0.32f)),
+                                      ImVec2(a.x + r * (0.46f + k * 0.40f), a.y + r * (0.42f + row * 0.32f)), col);
+            dl->AddLine(ImVec2(c.x - r * 0.45f, b.y - r * 0.27f), ImVec2(c.x + r * 0.45f, b.y - r * 0.27f), col, t);
+            break;
+        }
         default: break;
     }
 }
 
 // ---- crosshair / toast ----
 
-void UIManager::DrawCrosshairShape(ImDrawList* dl, float cx, float cy, const CrosshairSettings& s, float scale) {
-    const ImU32 col = ImGui::ColorConvertFloat4ToU32(ImVec4(s.color[0], s.color[1], s.color[2], s.color[3]));
-    const ImU32 outline = ImGui::ColorConvertFloat4ToU32(ImVec4(0, 0, 0, s.color[3] * 0.85f));
-    const float t = std::max(1.0f, s.thickness * scale);
-    const float len = s.size * scale;
-    const float gap = s.gap * scale;
-    const float o = s.outline ? s.outlineThickness * scale : 0.0f;
+bool UIManager::LoadImageTexture(const std::string& path, UINT maxSide, ComPtr<ID3D11ShaderResourceView>& out, float& ow,
+                                 float& oh, std::string& err) {
+    out.Reset();
+    err.clear();
+    if (path.empty() || !m_device) return false;
+    ComPtr<IWICImagingFactory> wic;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    UINT w = 0, h = 0;
+    if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) {
+        err = "WIC unavailable";
+        return false;
+    }
+    if (FAILED(wic->CreateDecoderFromFilename(Widen(path).c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
+                                              &decoder)) ||
+        FAILED(decoder->GetFrame(0, &frame)) || FAILED(frame->GetSize(&w, &h)) || !w || !h) {
+        err = "Can't read this image";
+        return false;
+    }
+    const float k = std::min(1.0f, static_cast<float>(maxSide) / static_cast<float>(std::max(w, h)));
+    const UINT fw = std::max(1u, static_cast<UINT>(w * k));
+    const UINT fh = std::max(1u, static_cast<UINT>(h * k));
+    std::vector<uint8_t> px;
+    if (!ReadScaled(wic.Get(), frame.Get(), fw, fh, px)) {
+        err = "Unsupported image format";
+        return false;
+    }
+    // ImGui's DX11 backend blends straight alpha
+    out = MakeTexture(m_device.Get(), px.data(), fw, fh);
+    if (!out) {
+        err = "Can't create texture";
+        return false;
+    }
+    ow = static_cast<float>(fw);
+    oh = static_cast<float>(fh);
+    return true;
+}
 
-    // odd thickness -> center on a half pixel so lines stay crisp
-    const float half = (static_cast<int>(std::round(t)) % 2) ? 0.5f : 0.0f;
-    const float x = std::floor(cx) + half;
-    const float y = std::floor(cy) + half;
-    const float ht = t * 0.5f;
+void UIManager::SyncCrosshairImage(const std::string& path) {
+    if (path == m_xhLoaded) return;
+    m_xhLoaded = path;
+    m_xhTex.Reset();
+    m_xhError.clear();
+    if (!path.empty()) LoadImageTexture(path, 1024, m_xhTex, m_xhW, m_xhH, m_xhError);
+}
 
-    auto rect = [&](float x0, float y0, float x1, float y1) {
-        if (o > 0) dl->AddRectFilled(ImVec2(x0 - o, y0 - o), ImVec2(x1 + o, y1 + o), outline);
-        dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x1, y1), col);
-    };
-    auto dot = [&] { rect(x - ht, y - ht, x + ht, y + ht); };
-    auto cross = [&](bool top) {
-        if (top) rect(x - ht, y - gap - len, x + ht, y - gap);
-        rect(x - ht, y + gap, x + ht, y + gap + len);
-        rect(x - gap - len, y - ht, x - gap, y + ht);
-        rect(x + gap, y - ht, x + gap + len, y + ht);
-    };
-    auto circle = [&] {
-        const float r = std::max(len, 2.0f);
-        if (o > 0) dl->AddCircle(ImVec2(x, y), r, outline, 0, t + o * 2);
-        dl->AddCircle(ImVec2(x, y), r, col, 0, t);
-    };
+float UIManager::CrosshairReach(const CrosshairSettings& x) {
+    if (x.style == static_cast<int>(CrosshairStyle::Image)) {
+        SyncCrosshairImage(x.imagePath);
+        if (!m_xhTex) return 8.0f;
+        // diagonal covers any rotation
+        return std::sqrt(m_xhW * m_xhW + m_xhH * m_xhH) * 0.5f * x.imageScale + 4.0f;
+    }
+    const float reach = std::max(x.size + x.gap, x.size) + std::max(x.thickness, x.dotSize) + x.outlineThickness * 2.0f + 6.0f;
+    return x.rotation != 0.0f ? reach * 1.42f : reach;
+}
 
-    switch (static_cast<CrosshairStyle>(s.style)) {
-        case CrosshairStyle::Dot: dot(); break;
-        case CrosshairStyle::Cross: cross(true); break;
-        case CrosshairStyle::Circle: circle(); break;
-        case CrosshairStyle::CrossDot: cross(true); dot(); break;
-        case CrosshairStyle::TShape: cross(false); break;
-        case CrosshairStyle::CircleDot: circle(); dot(); break;
-        default: break;
+void UIManager::DrawCrosshairShape(ImDrawList* dl, float cx, float cy, const CrosshairSettings& s, float scale, float time) {
+    ImVec4 base(s.color[0], s.color[1], s.color[2], s.color[3]);
+    if (s.rainbow) {
+        float r, g, b;
+        ImGui::ColorConvertHSVtoRGB(std::fmod(time * s.rainbowSpeed, 1.0f), 0.85f, 1.0f, r, g, b);
+        base = ImVec4(r, g, b, s.color[3]);
+    }
+    const ImU32 col = ImGui::ColorConvertFloat4ToU32(base);
+    const ImU32 outline = ImGui::ColorConvertFloat4ToU32(
+        ImVec4(s.outlineColor[0], s.outlineColor[1], s.outlineColor[2], s.outlineColor[3] * s.color[3]));
+    const int vtx0 = dl->VtxBuffer.Size;
+
+    if (s.style == static_cast<int>(CrosshairStyle::Image)) {
+        SyncCrosshairImage(s.imagePath);
+        if (!m_xhTex) return;
+        const float hw = m_xhW * s.imageScale * scale * 0.5f;
+        const float hh = m_xhH * s.imageScale * scale * 0.5f;
+        const ImVec2 c(std::floor(cx), std::floor(cy));
+        const ImU32 tint = s.imageTint ? col : ImGui::ColorConvertFloat4ToU32(ImVec4(1, 1, 1, s.color[3]));
+        dl->AddImage((ImTextureID)(uintptr_t)m_xhTex.Get(), ImVec2(c.x - hw, c.y - hh), ImVec2(c.x + hw, c.y + hh),
+                     ImVec2(0, 0), ImVec2(1, 1), tint);
+    } else {
+        const float t = std::max(1.0f, s.thickness * scale);
+        const float len = s.size * scale;
+        const float gap = s.gap * scale;
+        const float o = s.outline ? s.outlineThickness * scale : 0.0f;
+        const float ds = s.dotSize > 0.0f ? std::max(1.0f, s.dotSize * scale) : t;
+
+        // odd thickness -> center on a half pixel so lines stay crisp
+        const float half = (static_cast<int>(std::round(t)) % 2) ? 0.5f : 0.0f;
+        const float x = std::floor(cx) + half;
+        const float y = std::floor(cy) + half;
+        const float ht = t * 0.5f;
+
+        // outlines first, then fills, so overlapping parts never cut each other
+        struct R { float x0, y0, x1, y1; };
+        R rects[8];
+        int n = 0;
+        auto rect = [&](float x0, float y0, float x1, float y1) { rects[n++] = R{x0, y0, x1, y1}; };
+        auto cross = [&](bool top) {
+            if (top && s.armTop) rect(x - ht, y - gap - len, x + ht, y - gap);
+            if (s.armBottom) rect(x - ht, y + gap, x + ht, y + gap + len);
+            if (s.armLeft) rect(x - gap - len, y - ht, x - gap, y + ht);
+            if (s.armRight) rect(x + gap, y - ht, x + gap + len, y + ht);
+        };
+        auto dot = [&] {
+            const float hd = ds * 0.5f;
+            rect(x - hd, y - hd, x + hd, y + hd);
+        };
+        bool circle = false;
+        bool square = false;
+        switch (static_cast<CrosshairStyle>(s.style)) {
+            case CrosshairStyle::Dot: dot(); break;
+            case CrosshairStyle::Cross: cross(true); break;
+            case CrosshairStyle::Circle: circle = true; break;
+            case CrosshairStyle::CrossDot: cross(true); dot(); break;
+            case CrosshairStyle::TShape: cross(false); break;
+            case CrosshairStyle::CircleDot: circle = true; dot(); break;
+            case CrosshairStyle::Square: square = true; break;
+            default: break;
+        }
+        const float cr = std::max(len, 2.0f);
+        if (o > 0) {
+            for (int i = 0; i < n; ++i)
+                dl->AddRectFilled(ImVec2(rects[i].x0 - o, rects[i].y0 - o), ImVec2(rects[i].x1 + o, rects[i].y1 + o), outline);
+            if (circle) dl->AddCircle(ImVec2(x, y), cr, outline, 0, t + o * 2);
+            if (square) dl->AddRect(ImVec2(x - cr, y - cr), ImVec2(x + cr, y + cr), outline, 0, 0, t + o * 2);
+        }
+        for (int i = 0; i < n; ++i) dl->AddRectFilled(ImVec2(rects[i].x0, rects[i].y0), ImVec2(rects[i].x1, rects[i].y1), col);
+        if (circle) dl->AddCircle(ImVec2(x, y), cr, col, 0, t);
+        if (square) dl->AddRect(ImVec2(x - cr, y - cr), ImVec2(x + cr, y + cr), col, 0, 0, t);
+    }
+
+    if (s.rotation != 0.0f) {
+        const float a = s.rotation * kPi / 180.0f;
+        const float cs = std::cos(a), sn = std::sin(a);
+        const ImVec2 c(std::floor(cx), std::floor(cy));
+        for (int i = vtx0; i < dl->VtxBuffer.Size; ++i) {
+            ImVec2& p = dl->VtxBuffer[i].pos;
+            const ImVec2 d = p - c;
+            p = ImVec2(c.x + d.x * cs - d.y * sn, c.y + d.x * sn + d.y * cs);
+        }
     }
 }
 
-void UIManager::DrawCrosshair(const CrosshairSettings& s) {
+void UIManager::DrawCrosshair(const CrosshairSettings& s, float time) {
     // integer screen center, so the crosshair lands on the same pixels in any window layout
     const float cx = m_centerX + std::round(s.offsetX) - m_originX;
     const float cy = m_centerY + std::round(s.offsetY) - m_originY;
-    DrawCrosshairShape(ImGui::GetBackgroundDrawList(), cx, cy, s, 1.0f);
+    DrawCrosshairShape(ImGui::GetBackgroundDrawList(), cx, cy, s, 1.0f, time);
 }
 
 void UIManager::DrawToast(const std::string& text, float alpha) {
@@ -716,7 +831,7 @@ bool UIManager::NavItem(int index, const char* label, bool selected) {
     const ImVec4 icol = Mix(Mix(kDim, kText, hov * 0.6f), gAccent, sel);
     const float iconSize = 17.0f * m_scale;
     const float shift = sel * 3.0f * m_scale;
-    DrawIcon(dl, index, ImVec2(p.x + 22 * m_scale + shift, p.y + size.y * 0.5f), iconSize, Col(icol));
+    DrawIcon(dl, kTabIcons[index], ImVec2(p.x + 22 * m_scale + shift, p.y + size.y * 0.5f), iconSize, Col(icol));
     dl->AddText(ImVec2(p.x + 44 * m_scale + shift, p.y + (size.y - ImGui::GetFontSize()) * 0.5f), Col(col), label);
     return pressed;
 }
@@ -828,6 +943,12 @@ UiResult UIManager::DrawMenu(AppConfig& cfg, const UiStatus& st, bool open) {
     }
     const float e = EaseOut(m_menuT);
 
+    if (!open && m_capture) {
+        delete m_capture;
+        m_capture = nullptr;
+    }
+    const bool captureAtStart = m_capture != nullptr;
+    UpdateBindCapture();
     ApplyAccent(cfg.accent);
     SyncWallpaper(cfg);
     m_panelTint = cfg.wallpaperBlurPanels;
@@ -873,6 +994,7 @@ UiResult UIManager::DrawMenu(AppConfig& cfg, const UiStatus& st, bool open) {
             case Tab::Crosshair: CrosshairTab(cfg); break;
             case Tab::Zoom: ZoomTab(cfg); break;
             case Tab::Profiles: ProfilesTab(cfg); break;
+            case Tab::Advanced: AdvancedTab(cfg); break;
             case Tab::Settings: SettingsTab(cfg, st); break;
             default: break;
         }
@@ -882,7 +1004,7 @@ UiResult UIManager::DrawMenu(AppConfig& cfg, const UiStatus& st, bool open) {
     ImGui::End();
     ImGui::PopStyleVar();
 
-    if (open && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) res.closeMenu = true;
+    if (open && !captureAtStart && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) res.closeMenu = true;
     m_res = nullptr;
     return res;
 }
@@ -1056,6 +1178,7 @@ void UIManager::EffectsTab(AppConfig& cfg, const UiStatus& st) {
 void UIManager::CrosshairTab(AppConfig& cfg) {
     CrosshairSettings& x = cfg.Active().crosshair;
     const CrosshairSettings d{};
+    const bool image = x.style == static_cast<int>(CrosshairStyle::Image);
 
     if (!ImGui::BeginTable("##xhTbl", 2, ImGuiTableFlags_SizingStretchProp)) return;
     ImGui::TableSetupColumn("a", ImGuiTableColumnFlags_WidthStretch, 1.35f);
@@ -1075,13 +1198,49 @@ void UIManager::CrosshairTab(AppConfig& cfg) {
         }
         ImGui::EndCombo();
     }
-    Slider("Size", &x.size, 1.0f, 60.0f, d.size, "%.0f px");
-    Slider("Thickness", &x.thickness, 1.0f, 10.0f, d.thickness, "%.0f px");
-    Slider("Gap", &x.gap, 0.0f, 30.0f, d.gap, "%.0f px");
-    Toggle("Outline", &x.outline);
-    ImGui::BeginDisabled(!x.outline);
-    Slider("Outline width", &x.outlineThickness, 0.5f, 4.0f, d.outlineThickness, "%.1f px");
-    ImGui::EndDisabled();
+    if (image) {
+        LabelRow("Image");
+        if (AccentButton("Load PNG##xhimg", ImVec2(130 * m_scale, ImGui::GetFrameHeight()))) {
+            std::string path;
+            if (BrowseForImage(path)) {
+                x.imagePath = path;
+                m_res->changed = true;
+            }
+        }
+        if (!x.imagePath.empty()) {
+            ImGui::SameLine();
+            ImGui::PushFont(m_fontSmall);
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(kDim, "%s", std::filesystem::path(Widen(x.imagePath)).filename().string().c_str());
+            ImGui::PopFont();
+        }
+        SyncCrosshairImage(x.imagePath);
+        if (!m_xhError.empty()) ImGui::TextColored(kWarn, "%s", m_xhError.c_str());
+        else if (m_xhTex) ImGui::TextColored(kDim, "%.0f x %.0f px", m_xhW, m_xhH);
+        Slider("Scale", &x.imageScale, 0.05f, 4.0f, 1.0f, "%.2fx");
+        Toggle("Tint with color", &x.imageTint);
+    } else {
+        Slider("Size", &x.size, 1.0f, 60.0f, d.size, "%.0f px");
+        Slider("Thickness", &x.thickness, 1.0f, 10.0f, d.thickness, "%.0f px");
+        Slider("Gap", &x.gap, 0.0f, 30.0f, d.gap, "%.0f px");
+        Slider("Dot size", &x.dotSize, 0.0f, 12.0f, 0.0f, x.dotSize > 0.0f ? "%.0f px" : "auto");
+        LabelRow("Arms");
+        Toggle("Top##arm", &x.armTop);
+        ImGui::SameLine(0, 14 * m_scale);
+        Toggle("Bottom##arm", &x.armBottom);
+        ImGui::SameLine(0, 14 * m_scale);
+        Toggle("Left##arm", &x.armLeft);
+        ImGui::SameLine(0, 14 * m_scale);
+        Toggle("Right##arm", &x.armRight);
+        Toggle("Outline", &x.outline);
+        ImGui::BeginDisabled(!x.outline);
+        Slider("Outline width", &x.outlineThickness, 0.5f, 4.0f, d.outlineThickness, "%.1f px");
+        LabelRow("Outline color");
+        if (ImGui::ColorEdit4("##olc", x.outlineColor.data(), ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_DisplayHex))
+            m_res->changed = true;
+        ImGui::EndDisabled();
+    }
+    Slider("Rotation", &x.rotation, -180.0f, 180.0f, 0.0f, "%.0f deg");
     Slider("Offset X", &x.offsetX, -200.0f, 200.0f, 0.0f, "%.0f px");
     Slider("Offset Y", &x.offsetY, -200.0f, 200.0f, 0.0f, "%.0f px");
     LabelRow("Center on");
@@ -1091,9 +1250,17 @@ void UIManager::CrosshairTab(AppConfig& cfg) {
     }
     EndCard();
 
+    BeginCard("##xhbeh", "Behavior");
+    Toggle("Hide while zooming", &x.hideWhileZoom);
+    Toggle("Hide while aiming (right mouse)", &x.hideWhileRmb);
+    Toggle("Rainbow", &x.rainbow);
+    ImGui::BeginDisabled(!x.rainbow);
+    Slider("Cycle speed", &x.rainbowSpeed, 0.02f, 2.0f, 0.3f);
+    ImGui::EndDisabled();
+    EndCard();
+
     BeginCard("##xhcolor", "Color");
     {
-        // full custom picker: SV square + hue bar + alpha, with RGB and HEX inputs
         ImGui::SetNextItemWidth(std::min(ImGui::GetContentRegionAvail().x, 300.0f * m_scale));
         if (ImGui::ColorPicker4("##xhpick", x.color.data(),
                                 ImGuiColorEditFlags_AlphaBar | ImGuiColorEditFlags_PickerHueBar |
@@ -1130,8 +1297,13 @@ void UIManager::CrosshairTab(AppConfig& cfg) {
         dl->AddRectFilled(ImVec2(p.x, p.y + size.y * 0.55f), p + size, Col(ImVec4(0.22f, 0.21f, 0.17f, 1)), rr,
                           ImDrawFlags_RoundCornersBottom);
         dl->PushClipRect(p, p + size, true);
-        DrawCrosshairShape(dl, p.x + size.x * 0.5f, p.y + size.y * 0.5f, x, 2.0f);
+        float zoom = 2.0f;
+        if (image && m_xhTex) zoom = std::clamp(w * 0.8f / (std::max(m_xhW, m_xhH) * x.imageScale), 0.1f, 2.0f);
+        DrawCrosshairShape(dl, p.x + size.x * 0.5f, p.y + size.y * 0.5f, x, zoom, static_cast<float>(ImGui::GetTime()));
         dl->PopClipRect();
+        ImGui::PushFont(m_fontSmall);
+        ImGui::TextColored(kDim, "%.1fx", zoom);
+        ImGui::PopFont();
     }
     EndCard();
     ImGui::EndTable();
@@ -1145,14 +1317,13 @@ void UIManager::ZoomTab(AppConfig& cfg) {
     Toggle("Enabled##zoom", &z.enabled);
     ImGui::BeginDisabled(!z.enabled);
     LabelRow("Hold key");
-    if (ImGui::BeginCombo("##holdkey", HoldKeyName(z.holdKey))) {
-        for (const auto& k : kHoldKeys) {
-            if (ImGui::Selectable(k.name, z.holdKey == k.vk)) {
-                z.holdKey = k.vk;
-                m_res->changed = true;
-            }
+    {
+        KeyBind kb{z.holdKey, 0};
+        if (BindButton("##zoomkey", kb, false, ImGui::GetContentRegionAvail().x)) {
+            if (kb.vk == 0) kb.vk = VK_XBUTTON2;
+            z.holdKey = kb.vk;
+            m_res->changed = true;
         }
-        ImGui::EndCombo();
     }
     Slider("Magnification", &z.factor, 1.5f, 8.0f, d.factor, "%.1fx");
     Slider("Lens radius", &z.radius, 60.0f, 600.0f, d.radius, "%.0f px");
@@ -1171,9 +1342,10 @@ void UIManager::ProfilesTab(AppConfig& cfg) {
         ImGui::PushID(i);
         ImGui::AlignTextToFramePadding();
         ImGui::PushFont(m_fontBold);
-        ImGui::TextColored(active ? gAccent : kDim, "Ctrl+F%d", i + 1);
+        const std::string key = KeyBindName(cfg.binds[static_cast<size_t>(static_cast<int>(BindId::Profile1) + i)]);
+        ImGui::TextColored(active ? gAccent : kDim, "%s", key.c_str());
         ImGui::PopFont();
-        ImGui::SameLine(84 * m_scale);
+        ImGui::SameLine(100 * m_scale);
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 330 * m_scale);
         if (ImGui::InputText("##name", &pr.name)) {
             if (pr.name.size() > 64) pr.name.resize(64);
@@ -1188,8 +1360,10 @@ void UIManager::ProfilesTab(AppConfig& cfg) {
         ImGui::SameLine();
         if (ImGui::Button("Copy active", ImVec2(120 * m_scale, 0))) {
             const std::string name = pr.name;
+            const std::string exe = pr.autoExe;
             pr = cfg.Active();
             pr.name = name;
+            pr.autoExe = exe;
             m_res->changed = true;
         }
         ImGui::EndDisabled();
@@ -1200,6 +1374,151 @@ void UIManager::ProfilesTab(AppConfig& cfg) {
         }
         ImGui::PopID();
     }
+    EndCard();
+
+    BeginCard("##auto", "Auto switch");
+    Toggle("Switch profile by game", &cfg.autoProfile);
+    ImGui::BeginDisabled(!cfg.autoProfile);
+    Toggle("Turn effects off outside these games", &cfg.pauseWhenNotFocused);
+    ImGui::Spacing();
+    for (int i = 0; i < kProfileCount; ++i) {
+        Profile& pr = cfg.profiles[static_cast<size_t>(i)];
+        ImGui::PushID(i + 50);
+        LabelRow(pr.name.empty() ? "Profile" : pr.name.c_str());
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 150 * m_scale);
+        if (ImGui::InputTextWithHint("##exe", "RustClient.exe; cs2.exe", &pr.autoExe)) m_res->changed = true;
+        ImGui::SameLine();
+        ImGui::BeginDisabled(m_fgExe.empty());
+        if (ImGui::Button("Last game", ImVec2(-1, 0))) {
+            if (pr.autoExe.empty()) pr.autoExe = m_fgExe;
+            else if (pr.autoExe.find(m_fgExe) == std::string::npos) pr.autoExe += "; " + m_fgExe;
+            m_res->changed = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::PopID();
+    }
+    ImGui::PushFont(m_fontSmall);
+    ImGui::TextColored(kDim, "Last focused: %s", m_fgExe.empty() ? "-" : m_fgExe.c_str());
+    ImGui::PopFont();
+    ImGui::EndDisabled();
+    EndCard();
+}
+
+// ---- key binds ----
+
+bool UIManager::BindButton(const char* id, KeyBind& b, bool allowMods, float width) {
+    ImGui::PushID(id);
+    std::string text = KeyBindName(b);
+    text += "##bind";
+    const ImVec2 size(width, ImGui::GetFrameHeight());
+    bool changed = false;
+    // ZoomTab passes a temporary, so match by id as well
+    static ImGuiID s_captureId = 0;
+    const ImGuiID myId = ImGui::GetID("##bindbtn");
+    const bool mine = m_capture && s_captureId == myId;
+    if (mine) text = "Press a key...  (Esc cancel, Backspace clear)##bind";
+    if (AccentButton(text.c_str(), size) && !m_capture) {
+        m_capture = new KeyBind(b);  // scratch copy, filled by UpdateBindCapture
+        s_captureId = myId;
+        m_captureMods = allowMods;
+        m_captureFrames = 0;
+        for (int vk = 0; vk < 256; ++vk) m_captureDown[static_cast<size_t>(vk)] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    }
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && !m_capture) {
+        b = KeyBind{};
+        changed = true;
+    }
+    if (mine && m_captureFrames < 0) {
+        // capture finished: -1 = accepted, -2 = cancelled
+        if (m_captureFrames == -1) {
+            b = *m_capture;
+            changed = true;
+        }
+        delete m_capture;
+        m_capture = nullptr;
+        s_captureId = 0;
+    }
+    if (changed && m_res) m_res->changed = true;
+    ImGui::PopID();
+    return changed;
+}
+
+void UIManager::UpdateBindCapture() {
+    if (!m_capture || m_captureFrames < 0) return;
+    ++m_captureFrames;
+    auto isMod = [](int vk) {
+        return vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || (vk >= VK_LSHIFT && vk <= VK_RMENU) || vk == VK_LWIN ||
+               vk == VK_RWIN;
+    };
+    for (int vk = 1; vk < 256; ++vk) {
+        const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        const bool was = m_captureDown[static_cast<size_t>(vk)];
+        m_captureDown[static_cast<size_t>(vk)] = down;
+        if (!down || was || isMod(vk) || vk == VK_LBUTTON) continue;
+        if (vk == VK_ESCAPE) {
+            m_captureFrames = -2;
+            return;
+        }
+        if (vk == VK_BACK || vk == VK_DELETE) {
+            *m_capture = KeyBind{};
+            m_captureFrames = -1;
+            return;
+        }
+        int mods = 0;
+        if (m_captureMods) {
+            if (GetAsyncKeyState(VK_CONTROL) & 0x8000) mods |= MOD_CONTROL;
+            if (GetAsyncKeyState(VK_MENU) & 0x8000) mods |= MOD_ALT;
+            if (GetAsyncKeyState(VK_SHIFT) & 0x8000) mods |= MOD_SHIFT;
+        }
+        *m_capture = KeyBind{vk, mods};
+        m_captureFrames = -1;
+        return;
+    }
+}
+
+void UIManager::AdvancedTab(AppConfig& cfg) {
+    BeginCard("##binds", "Key binds");
+    {
+        ImGui::PushFont(m_fontSmall);
+        ImGui::TextColored(kDim, "Click to rebind, right click to clear. Mouse 2-5 and modifiers work.");
+        ImGui::PopFont();
+        ImGui::Spacing();
+        static const char* names[] = {"Open menu",     "Panic reset",     "Toggle everything", "Profile 1",
+                                      "Profile 2",     "Profile 3",       "Profile 4",         "Next profile",
+                                      "Crosshair on/off", "Shaders on/off", "Hold: show original"};
+        static_assert(std::size(names) == static_cast<size_t>(kBindCount));
+        if (ImGui::BeginTable("##bindTbl", 2, ImGuiTableFlags_SizingStretchSame)) {
+            for (int i = 0; i < kBindCount; ++i) {
+                ImGui::TableNextColumn();
+                ImGui::PushID(i);
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextColored(kDim, "%s", names[i]);
+                ImGui::SameLine(150 * m_scale);
+                KeyBind& b = cfg.binds[static_cast<size_t>(i)];
+                BindButton("##b", b, true, ImGui::GetContentRegionAvail().x - 8 * m_scale);
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        // duplicate check
+        for (int i = 0; i < kBindCount; ++i)
+            for (int j = i + 1; j < kBindCount; ++j)
+                if (cfg.binds[static_cast<size_t>(i)].vk && cfg.binds[static_cast<size_t>(i)] == cfg.binds[static_cast<size_t>(j)]) {
+                    ImGui::TextColored(kWarn, "Same key used twice: %s", KeyBindName(cfg.binds[static_cast<size_t>(i)]).c_str());
+                    i = j = kBindCount;
+                }
+        if (cfg.binds[static_cast<size_t>(BindId::Menu)].vk == 0)
+            ImGui::TextColored(kWarn, "No menu key - use the tray icon to open the menu");
+        if (AccentButton("Restore default binds", ImVec2(220 * m_scale, 30 * m_scale))) {
+            cfg.binds = AppConfig{}.binds;
+            m_res->changed = true;
+        }
+    }
+    EndCard();
+
+    BeginCard("##startup", "General");
+    Toggle("Start with Windows", &cfg.startWithWindows);
+    Toggle("Show notifications", &cfg.showToasts);
     EndCard();
 }
 
@@ -1295,7 +1614,7 @@ void UIManager::SettingsTab(AppConfig& cfg, const UiStatus& st) {
             ImGui::SameLine(170 * m_scale);
             ImGui::TextColored(ok ? kText : kWarn, "%s", ok ? good : bad);
         };
-        line("Hotkeys", st.hotkeysOk, "Insert  /  Ctrl+F1-F4  /  End", "some are taken by another app");
+        line("Hotkeys", st.hotkeysOk, "ok", "some are taken by another app");
         line("Magnification", st.magnificationOk, "ok", "unavailable");
         line("Gamma ramp", st.gammaOk, "ok", "rejected");
         line("Capture exclusion", st.captureExcluded, "ok", "unsupported");

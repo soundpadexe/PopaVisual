@@ -61,7 +61,11 @@ public:
         m_centerX = centerX;
         m_centerY = centerY;
     }
-    void DrawCrosshair(const CrosshairSettings& s);
+    void DrawCrosshair(const CrosshairSettings& s, float time);
+    // half-size of the box the crosshair needs, px
+    float CrosshairReach(const CrosshairSettings& s);
+    bool CapturingBind() const noexcept { return m_capture != nullptr; }
+    void SetForegroundExe(const std::string& exe) { m_fgExe = exe; }
     void DrawToast(const std::string& text, float alpha);
     // Call while open, and keep calling after close until MenuVisible() is false (fade-out).
     UiResult DrawMenu(AppConfig& cfg, const UiStatus& status, bool open);
@@ -71,7 +75,7 @@ public:
     static bool HandleMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 private:
-    enum class Tab : int { Color = 0, Effects, Crosshair, Zoom, Profiles, Settings, Count };
+    enum class Tab : int { Color = 0, Effects, Crosshair, Zoom, Profiles, Advanced, Settings, Count };
 
     void LoadFonts();
     void ApplyStyle();
@@ -86,6 +90,10 @@ private:
     void ZoomTab(AppConfig& cfg);
     void ProfilesTab(AppConfig& cfg);
     void SettingsTab(AppConfig& cfg, const UiStatus& st);
+    void AdvancedTab(AppConfig& cfg);
+    bool BindButton(const char* id, KeyBind& b, bool allowMods, float width);
+    void UpdateBindCapture();
+    void SyncCrosshairImage(const std::string& path);
 
     // widgets
     bool Toggle(const char* label, bool* v);
@@ -108,7 +116,9 @@ private:
     float Anim(unsigned id, float target, float speed = 14.0f);
 
     static void DrawIcon(ImDrawList* dl, int icon, const ImVec2& c, float size, unsigned col);
-    static void DrawCrosshairShape(ImDrawList* dl, float cx, float cy, const CrosshairSettings& s, float scale);
+    void DrawCrosshairShape(ImDrawList* dl, float cx, float cy, const CrosshairSettings& s, float scale, float time);
+    bool LoadImageTexture(const std::string& path, UINT maxSide, Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>& out,
+                          float& w, float& h, std::string& err);
 
     bool m_initialized = false;
     HWND m_hwnd = nullptr;
@@ -138,6 +148,19 @@ private:
     float m_wallW = 0.0f, m_wallH = 0.0f;
     std::string m_wallLoaded;
     std::string m_wallError;
+
+    // custom crosshair image
+    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_xhTex;
+    float m_xhW = 0.0f, m_xhH = 0.0f;
+    std::string m_xhLoaded;
+    std::string m_xhError;
+
+    // key bind capture
+    KeyBind* m_capture = nullptr;
+    bool m_captureMods = true;
+    std::array<bool, 256> m_captureDown{};
+    int m_captureFrames = 0;
+    std::string m_fgExe;
 
     ImFont* m_fontRegular = nullptr;
     ImFont* m_fontBold = nullptr;
